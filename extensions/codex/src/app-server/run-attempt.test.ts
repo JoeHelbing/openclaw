@@ -7196,6 +7196,7 @@ describe("runCodexAppServerAttempt", () => {
           ],
         };
       }
+      return undefined;
     });
     for (let turn = 0; turn < 2; turn += 1) {
       const params = createParams(sessionFile, workspaceDir);
