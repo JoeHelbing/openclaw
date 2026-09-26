@@ -7112,6 +7112,107 @@ describe("runCodexAppServerAttempt", () => {
       serviceTier: "ultrafast",
     });
   });
+  it.each([
+    { name: "supported model", supported: true, fastMode: true, expected: "ultrafast" },
+    { name: "unsupported model", supported: false, fastMode: true, expected: "priority" },
+    { name: "Fast off", supported: true, fastMode: false, expected: null },
+    { name: "standalone setting", supported: true, fastMode: undefined, expected: "ultrafast" },
+    {
+      name: "auto activates after resume",
+      supported: true,
+      fastMode: false,
+      activateAuto: true,
+      expected: "ultrafast",
+    },
+  ])(
+    "applies optional Ultrafast for $name at the actual turn boundary",
+    async ({ supported, fastMode, activateAuto, expected }) => {
+      const { sessionFile, workspaceDir } = createRunPaths();
+      await writeExistingBinding(sessionFile, workspaceDir, { model: "gpt-5.2" });
+      const harness = createResumeHarness("thread-existing", async (method) => {
+        if (method === "model/list") {
+          return {
+            data: [
+              {
+                id: "catalog-alias",
+                model: "gpt-5.4-codex",
+                displayName: "Test model",
+                description: "Test model",
+                hidden: false,
+                isDefault: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: "medium",
+                serviceTiers: supported
+                  ? [{ id: "ultrafast", name: "Ultrafast", description: "Faster" }]
+                  : [],
+              },
+            ],
+            nextCursor: null,
+          };
+        }
+      });
+      const params = createParams(sessionFile, workspaceDir);
+      let active = fastMode;
+      params.fastMode = activateAuto ? () => active : fastMode;
+      params.onAgentEvent = (event) => {
+        if (
+          event.stream === "codex_app_server.lifecycle" &&
+          event.data.phase === "thread_ready" &&
+          activateAuto
+        ) {
+          active = true;
+        }
+      };
+      const run = runCodexAppServerAttempt(params, {
+        pluginConfig: { appServer: { enableUltrafast: true } },
+      });
+      await completeStartedRun(run, harness.waitForMethod, harness.completeTurn, "thread-existing");
+      expect(
+        harness.requests.find((request) => request.method === "turn/start")?.params,
+      ).toMatchObject({
+        serviceTier: expected,
+      });
+    },
+  );
+
+  it("keeps standalone Ultrafast on consecutive warm turns", async () => {
+    const { sessionFile, workspaceDir } = createRunPaths();
+    await writeExistingBinding(sessionFile, workspaceDir, { model: "gpt-5.2" });
+    const harness = createResumeHarness("thread-existing", async (method) => {
+      if (method === "model/list") {
+        return {
+          data: [
+            {
+              id: "catalog-alias",
+              model: "gpt-5.4-codex",
+              displayName: "Test model",
+              description: "Test model",
+              hidden: false,
+              isDefault: false,
+              supportedReasoningEfforts: [],
+              defaultReasoningEffort: "medium",
+              serviceTiers: [{ id: "ultrafast", name: "Ultrafast", description: "Faster" }],
+            },
+          ],
+        };
+      }
+    });
+    for (let turn = 0; turn < 2; turn += 1) {
+      const params = createParams(sessionFile, workspaceDir);
+      const run = runCodexAppServerAttempt(params, {
+        pluginConfig: { appServer: { enableUltrafast: true } },
+      });
+      await run.waitForTurnAccepted();
+      await harness.completeTurn({ threadId: "thread-existing", turnId: "turn-1" });
+      await run;
+    }
+    expect(
+      harness.requests
+        .filter((request) => request.method === "turn/start")
+        .map((request) => (request.params as { serviceTier?: string | null }).serviceTier),
+    ).toEqual(["ultrafast", "ultrafast"]);
+  });
+
   it("reuses the bound auth profile for app-server startup when params omit it", async () => {
     const { sessionFile, workspaceDir } = createRunPaths();
     await writeExistingBinding(sessionFile, workspaceDir, {

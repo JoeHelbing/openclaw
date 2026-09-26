@@ -28,6 +28,7 @@ import {
 } from "./run-attempt-lifecycle.js";
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
 import type { CodexAttemptTurnState } from "./run-attempt-turn-state.js";
+import { resolveCodexUltrafastServiceTier } from "./service-tier.js";
 import { buildTurnStartParams } from "./thread-lifecycle.js";
 import { recordCodexTrajectoryContext } from "./trajectory.js";
 import { buildCodexUserPromptMessage } from "./transcript-mirror.js";
@@ -164,9 +165,8 @@ export async function prepareCodexAttemptTurnRequest(
     const turnAppServer = withCodexAppServerFastModeServiceTier(
       connection.mutable.pluginAppServer,
       runtimeParams,
-      connection.appServer.serviceTier,
+      connection.appServer,
     );
-    connection.mutable.pluginAppServer = turnAppServer;
     const references = prepareWorkspaceReferences();
     const inferenceRoute = getCodexInferenceThread(
       resourceState.client,
@@ -199,6 +199,20 @@ export async function prepareCodexAttemptTurnRequest(
         (tool) => tool.name === "session_status",
       ),
     });
+    const serviceTier = await resolveCodexUltrafastServiceTier({
+      enabled: turnAppServer.enableUltrafast === true && turnAppServer.serviceTier !== null,
+      serviceTier: turnStartParams.serviceTier,
+      model: turnStartParams.model ?? model,
+      modelProvider,
+      client: turnClient,
+      timeoutMs: Math.min(params.timeoutMs, 2500),
+      signal: runAbortController.signal,
+      assertCurrent: assertTurnCurrent,
+      config: params.config,
+    });
+    assertTurnCurrent();
+    turnStartParams.serviceTier = serviceTier;
+    connection.mutable.pluginAppServer = { ...turnAppServer, serviceTier };
     // Prepared runtime mappings retain catalog authorization; a retry must
     // authorize the model actually encoded for the substituted turn.
     const authorizedModel = nativeModel
