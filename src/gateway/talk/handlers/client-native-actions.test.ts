@@ -2,6 +2,7 @@ import { setImmediate as nextEventLoopTurn } from "node:timers/promises";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { createAssistantMessageEventStream } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { runQaGatewayFixture } from "../../../../test/helpers/qa-gateway-cleanup.js";
 import { extractText } from "../../../../ui/src/lib/chat/message-extract.ts";
 import * as admission from "../../../agents/admitted-run-context.js";
 import {
@@ -345,21 +346,21 @@ describe("native Talk action ownership through public plugin registration", () =
       } finally {
         providerStream.push({ type: "done", reason: "stop", message: answer });
         providerStream.end();
-        try {
-          await modelRun;
-        } finally {
-          try {
+        await runQaGatewayFixture(
+          async () => {
+            await modelRun;
+          },
+          async () => {
             const results = await Promise.allSettled(publications);
             for (const result of results) {
               if (result.status === "rejected") {
                 throw result.reason;
               }
             }
-          } finally {
-            unsubscribe();
-            rowProjection.dispose();
-          }
-        }
+          },
+          unsubscribe,
+          () => rowProjection.dispose(),
+        );
       }
     });
   });
