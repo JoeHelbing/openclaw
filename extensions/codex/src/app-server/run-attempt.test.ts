@@ -7150,6 +7150,7 @@ describe("runCodexAppServerAttempt", () => {
             nextCursor: null,
           };
         }
+        return undefined;
       });
       const params = createParams(sessionFile, workspaceDir);
       let active = fastMode;
