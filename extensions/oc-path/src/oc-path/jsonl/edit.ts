@@ -5,7 +5,7 @@
  * @module @openclaw/oc-path/jsonl/edit
  */
 
-import type { JsoncEntry, JsoncValue } from "../jsonc/ast.js";
+import type { JsoncValue } from "../jsonc/ast.js";
 import { resolveJsoncPositionalSegment } from "../jsonc/resolve-value.js";
 import type { OcPath } from "../oc-path.js";
 import {
@@ -15,7 +15,7 @@ import {
   unquoteSeg,
 } from "../oc-path.js";
 import type { JsonlAst, JsonlLine } from "./ast.js";
-import { emitJsonl } from "./emit.js";
+import { renderJsonl } from "./emit.js";
 import { pickJsonlLineIndex } from "./line.js";
 
 type JsonlEditResult =
@@ -29,9 +29,6 @@ export function setJsonlOcPath(ast: JsonlAst, path: OcPath, newValue: JsoncValue
   }
 
   const lineIdx = pickJsonlLineIndex(ast, head);
-  if (lineIdx === -1) {
-    return { ok: false, reason: "unresolved" };
-  }
   const target = ast.lines[lineIdx];
   if (target === undefined) {
     return { ok: false, reason: "unresolved" };
@@ -42,27 +39,18 @@ export function setJsonlOcPath(ast: JsonlAst, path: OcPath, newValue: JsoncValue
   }
 
   // Quote-aware split keeps edit symmetric with resolveJsonlOcPath.
-  const segments: string[] = [];
-  if (path.item !== undefined) {
-    segments.push(...splitRespectingBrackets(path.item, "."));
-  }
-  if (path.field !== undefined) {
-    segments.push(...splitRespectingBrackets(path.field, "."));
-  }
+  const segments = [path.item, path.field].flatMap((slot) =>
+    slot === undefined ? [] : splitRespectingBrackets(slot, "."),
+  );
 
   const replaced = replaceAt(target.value, segments, 0, newValue);
   if (replaced === null) {
     return { ok: false, reason: "unresolved" };
   }
-  const newLine: JsonlLine = {
-    kind: "value",
-    line: target.line,
-    value: replaced,
-    raw: target.raw,
+  return {
+    ok: true,
+    ast: renderEditedJsonl(ast, ast.lines.with(lineIdx, { ...target, value: replaced }), path.file),
   };
-  const newLines = ast.lines.slice();
-  newLines[lineIdx] = newLine;
-  return { ok: true, ast: renderEditedJsonl(ast, newLines, path.file) };
 }
 
 function replaceAt(
@@ -86,55 +74,31 @@ function replaceAt(
     seg = resolved;
   }
 
-  if (current.kind === "object") {
-    // Positional tokens resolve against the entries' ordered key list;
-    // quoted segments are unquoted before literal-key comparison.
-    const lookupKey = unquoteSeg(seg);
-    const idx = current.entries.findIndex((e) => e.key === lookupKey);
-    if (idx === -1) {
-      return null;
-    }
-    const child = current.entries[idx];
-    if (child === undefined) {
-      return null;
-    }
-    const replacedChild = replaceAt(child.value, segments, i + 1, newValue);
-    if (replacedChild === null) {
-      return null;
-    }
-    const newEntry: JsoncEntry = { ...child, value: replacedChild };
-    const newEntries = current.entries.slice();
-    newEntries[idx] = newEntry;
-    return {
-      kind: "object",
-      entries: newEntries,
-      ...(current.line !== undefined ? { line: current.line } : {}),
-    };
+  if (current.kind !== "object" && current.kind !== "array") {
+    return null;
   }
-
-  if (current.kind === "array") {
-    const idx = parseArrayIndexSegment(seg, current.items.length);
-    if (idx === null) {
-      return null;
-    }
-    const child = current.items[idx];
-    if (child === undefined) {
-      return null;
-    }
-    const replacedChild = replaceAt(child, segments, i + 1, newValue);
-    if (replacedChild === null) {
-      return null;
-    }
-    const newItems = current.items.slice();
-    newItems[idx] = replacedChild;
-    return {
-      kind: "array",
-      items: newItems,
-      ...(current.line !== undefined ? { line: current.line } : {}),
-    };
+  // Positional tokens use the ordered key list; quoted keys remain literal.
+  const lookupKey = unquoteSeg(seg);
+  const index =
+    current.kind === "object"
+      ? current.entries.findIndex((entry) => entry.key === lookupKey)
+      : (parseArrayIndexSegment(seg, current.items.length) ?? -1);
+  const child = current.kind === "object" ? current.entries[index]?.value : current.items[index];
+  if (child === undefined) {
+    return null;
   }
-
-  return null;
+  const replaced = replaceAt(child, segments, i + 1, newValue);
+  if (replaced === null) {
+    return null;
+  }
+  return current.kind === "object"
+    ? {
+        ...current,
+        entries: current.entries.map((entry, at) =>
+          at === index ? { ...entry, value: replaced } : entry,
+        ),
+      }
+    : { ...current, items: current.items.with(index, replaced) };
 }
 
 function renderEditedJsonl(
@@ -148,12 +112,7 @@ function renderEditedJsonl(
     lines,
     ...(ast.lineEnding !== undefined ? { lineEnding: ast.lineEnding } : {}),
   };
-  const opts =
-    fileName !== undefined
-      ? { mode: "render" as const, fileNameForGuard: fileName }
-      : { mode: "render" as const };
-  const rendered = emitJsonl(next, opts);
-  return { ...next, raw: rendered };
+  return { ...next, raw: renderJsonl(next, fileName) };
 }
 
 /** Append a value as the next line. Line numbers are substrate-assigned. */

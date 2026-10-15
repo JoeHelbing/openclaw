@@ -54,28 +54,7 @@ export { chunkMatrixText, prepareMatrixSingleText } from "./send/chunking.js";
 export { resolveMatrixMentionsForBody } from "./send/formatting.js";
 export { resolveMatrixRoomId } from "./send/targets.js";
 
-type MatrixClientResolveOpts = {
-  client?: MatrixClient;
-  cfg?: CoreConfig;
-  timeoutMs?: number;
-  accountId?: string | null;
-};
-
-function isMatrixClient(value: MatrixClient | MatrixClientResolveOpts): value is MatrixClient {
-  return typeof (value as { sendEvent?: unknown }).sendEvent === "function";
-}
-
-function normalizeMatrixClientResolveOpts(
-  opts?: MatrixClient | MatrixClientResolveOpts,
-): MatrixClientResolveOpts {
-  if (!opts) {
-    return {};
-  }
-  if (isMatrixClient(opts)) {
-    return { client: opts };
-  }
-  return opts;
-}
+type MatrixClientResolveOpts = Parameters<typeof withResolvedMatrixControlClient>[0];
 
 function resolvePreviousThreadId(previousEvent: unknown): string | undefined {
   if (!previousEvent || typeof previousEvent !== "object") {
@@ -180,10 +159,18 @@ export async function sendMessageMatrix(
         let textRelation = relation;
         let pendingExtraContent = opts.extraContent;
         const events: Omit<MatrixPreparedEvent, "transactionId">[] = [];
-        const prepareContent = (
+        const prepareContent = async (
           content: MatrixOutboundContent,
           receiptKind: MessageReceiptPartKind,
+          markdown: string,
         ) => {
+          await enrichMatrixFormattedContent({
+            client,
+            content,
+            markdown,
+            preparedBody: markdown === convertedText ? singleEventBody : undefined,
+            tableMode,
+          });
           events.push({
             content: withMatrixExtraContentFields(content, pendingExtraContent),
             receiptKind,
@@ -236,14 +223,7 @@ export async function sendMessageMatrix(
             isVoice: useVoice,
             imageInfo,
           });
-          await enrichMatrixFormattedContent({
-            client,
-            content,
-            markdown: captionMarkdown,
-            preparedBody: captionMarkdown === convertedText ? singleEventBody : undefined,
-            tableMode,
-          });
-          prepareContent(content, receiptKind);
+          await prepareContent(content, receiptKind, captionMarkdown);
           textChunks = useVoice ? chunks : rest;
           textRelation = useVoice || threadId ? relation : undefined;
         }
@@ -251,15 +231,7 @@ export async function sendMessageMatrix(
           if (!chunk.trim()) {
             continue;
           }
-          const content = buildTextContent(chunk, textRelation);
-          await enrichMatrixFormattedContent({
-            client,
-            content,
-            markdown: chunk,
-            preparedBody: chunk === convertedText ? singleEventBody : undefined,
-            tableMode,
-          });
-          prepareContent(content, "text");
+          await prepareContent(buildTextContent(chunk, textRelation), "text", chunk);
         }
         plannedEvents = durableIdentity
           ? createMatrixPlannedEvents({ identity: durableIdentity, events })
@@ -383,29 +355,13 @@ export async function sendPollMatrix(
 export async function sendTypingMatrix(
   roomId: string,
   typing: boolean,
-  optsOrTimeoutMs?: number | MatrixClientResolveOpts,
-  client?: MatrixClient,
+  opts: MatrixClientResolveOpts = {},
 ): Promise<void> {
-  const opts =
-    typeof optsOrTimeoutMs === "number"
-      ? { timeoutMs: optsOrTimeoutMs, ...(client ? { client } : {}) }
-      : {
-          ...normalizeMatrixClientResolveOpts(optsOrTimeoutMs),
-          ...(client ? { client } : {}),
-        };
-  await withResolvedMatrixControlClient(
-    {
-      client: opts.client,
-      cfg: opts.cfg,
-      timeoutMs: opts.timeoutMs,
-      accountId: opts.accountId,
-    },
-    async (resolved) => {
-      const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);
-      const resolvedTimeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 30_000;
-      await resolved.setTyping(resolvedRoom, typing, resolvedTimeoutMs);
-    },
-  );
+  await withResolvedMatrixControlClient(opts, async (resolved) => {
+    const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);
+    const resolvedTimeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : 30_000;
+    await resolved.setTyping(resolvedRoom, typing, resolvedTimeoutMs);
+  });
 }
 
 export async function sendReadReceiptMatrix(
@@ -616,15 +572,12 @@ export async function reactMatrixMessage(
   roomId: string,
   messageId: string,
   emoji: string,
-  opts?: MatrixClient | MatrixClientResolveOpts,
+  opts: MatrixClientResolveOpts = {},
 ): Promise<void> {
-  const clientOpts = normalizeMatrixClientResolveOpts(opts);
   await withResolvedMatrixSendClient(
     {
-      client: clientOpts.client,
-      cfg: clientOpts.cfg,
-      timeoutMs: clientOpts.timeoutMs,
-      accountId: clientOpts.accountId ?? undefined,
+      ...opts,
+      accountId: opts.accountId ?? undefined,
     },
     async (resolved) => {
       const resolvedRoom = await resolveMatrixRoomId(resolved, roomId);

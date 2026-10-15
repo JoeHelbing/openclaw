@@ -33,6 +33,7 @@ class MemoryBeforeRequesterSequencer extends BaseSequencer {
 const config = createUnitFastVitestConfig();
 export default {
   ...config,
+  cacheDir: ${JSON.stringify(path.join(root, ".vite"))},
   test: {
     ...config.test,
     include: [memoryTest, "src/agents/cli-runner/bundle-mcp.requester-lifecycle.test.ts"],
@@ -94,5 +95,6 @@ export default {
       );
       expect(memory.endTime).toBeLessThanOrEqual(requester.startTime);
     }),
-  180_000,
+  // A cold nested Vitest run of both files takes over 180s on loaded 4-CPU hosts.
+  600_000,
 );

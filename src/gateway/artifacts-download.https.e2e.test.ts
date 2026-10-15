@@ -8,8 +8,9 @@ import type {
 } from "../../packages/gateway-protocol/src/schema/artifacts.js";
 import { acquireGatewayTestClient } from "../../test/helpers/gateway-client.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
+import { captureRuntimeConfigAsyncReader } from "../config/io.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.sqlite-entry.js";
-import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.js";
+import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
 import { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { acquireTestPortBlock } from "../test-utils/port-claims.js";
@@ -42,7 +43,6 @@ test("downloads inline artifacts over authenticated WSS and HTTPS with live tick
       const sessionKey = "agent:main:artifact-https";
       const sessionId = "artifact-https-session";
       const runId = "artifact-https-run";
-      const taskId = "artifact-https-task";
       const scope = { agentId: "main", sessionKey, sessionId, env: state.env };
       const binary = Buffer.from(Array.from({ length: 8192 }, (_, index) => index % 256));
       const fixtures = [
@@ -93,7 +93,7 @@ test("downloads inline artifacts over authenticated WSS and HTTPS with live tick
                   }
                 : { data: fixture.bytes.toString("base64") }),
             })),
-            __openclaw: { id: "inline-artifacts", runId, messageTaskId: taskId },
+            __openclaw: { id: "inline-artifacts", runId },
           },
         },
       ];
@@ -110,6 +110,7 @@ test("downloads inline artifacts over authenticated WSS and HTTPS with live tick
               tls: { enabled: true, certPath, keyPath },
             },
           });
+          await captureRuntimeConfigAsyncReader()();
           await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
           await replaceTranscriptEvents(scope, events);
           server = await startClaimedGateway(claim, () =>
@@ -146,7 +147,7 @@ test("downloads inline artifacts over authenticated WSS and HTTPS with live tick
             return client;
           };
           const client = await connect("reader", ["operator.read"]);
-          const query = { sessionKey, runId, taskId, messageRole: "assistant" };
+          const query = { sessionKey, runId, messageRole: "assistant" };
           const listed = await client.request<ArtifactsListResult>("artifacts.list", query);
           expect(listed.artifacts).toHaveLength(fixtures.length);
           const request = async (

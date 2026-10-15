@@ -1,5 +1,4 @@
 import { isMobileNavLayout } from "./mobile-nav-layout.ts";
-import { navDrawerFocusableElements } from "./navigation-surface.ts";
 
 const MIN_OPEN_DISTANCE_PX = 44;
 const OPEN_RATIO = 0.15;
@@ -16,9 +15,9 @@ type Swipe = {
   backdrop: HTMLElement | null;
 };
 
-export type NavDrawerHost = HTMLElement & {
+export type NavDrawerHost = Pick<HTMLElement, "querySelector" | "isConnected"> & {
+  readonly element: HTMLElement;
   readonly onboardingMode: boolean;
-  readonly updateComplete: Promise<boolean>;
   readonly navDrawerOpen: boolean;
 };
 
@@ -31,25 +30,27 @@ export class NavDrawerSwipeOwner {
   ) {}
 
   private canOpen(): boolean {
-    return isMobileNavLayout() && !this.host.navDrawerOpen && !this.host.onboardingMode;
+    return (
+      isMobileNavLayout() &&
+      !this.host.navDrawerOpen &&
+      !this.host.onboardingMode &&
+      !document.openClawModalLayers?.size
+    );
   }
 
   connect(): void {
-    this.host.addEventListener("touchstart", this.handleStart, { passive: true });
-    this.host.addEventListener("touchmove", this.handleMove, { passive: false });
-    this.host.addEventListener("touchend", this.handleEnd, { passive: true });
-    this.host.addEventListener("touchcancel", this.handleCancel, { passive: true });
-    if (this.host.navDrawerOpen) {
-      this.opened();
-    }
+    this.host.element.addEventListener("touchstart", this.handleStart, { passive: true });
+    this.host.element.addEventListener("touchmove", this.handleMove, { passive: false });
+    this.host.element.addEventListener("touchend", this.handleEnd, { passive: true });
+    this.host.element.addEventListener("touchcancel", this.cancel, { passive: true });
   }
 
   disconnect(): void {
-    this.host.removeEventListener("touchstart", this.handleStart);
-    this.host.removeEventListener("touchmove", this.handleMove);
-    this.host.removeEventListener("touchend", this.handleEnd);
-    this.host.removeEventListener("touchcancel", this.handleCancel);
-    this.closed();
+    this.host.element.removeEventListener("touchstart", this.handleStart);
+    this.host.element.removeEventListener("touchmove", this.handleMove);
+    this.host.element.removeEventListener("touchend", this.handleEnd);
+    this.host.element.removeEventListener("touchcancel", this.cancel);
+    this.reset();
   }
 
   reset(): void {
@@ -62,23 +63,6 @@ export class NavDrawerSwipeOwner {
     backdrop?.removeAttribute("data-nav-drawer-dragging");
     backdrop?.style.removeProperty("visibility");
     backdrop?.style.removeProperty("opacity");
-  }
-
-  opened(): void {
-    void this.host.updateComplete.then(() => {
-      if (!this.host.isConnected || !this.host.navDrawerOpen) {
-        return;
-      }
-      this.reset();
-      const drawer = this.host.querySelector<HTMLElement>(".shell-nav");
-      if (drawer) {
-        (navDrawerFocusableElements(drawer)[0] ?? drawer).focus({ preventScroll: true });
-      }
-    });
-  }
-
-  closed(): void {
-    this.reset();
   }
 
   private paint(swipe: Swipe, deltaX: number): void {
@@ -101,10 +85,10 @@ export class NavDrawerSwipeOwner {
     backdrop.style.opacity = String(swipe.drawerWidth > 0 ? reveal / swipe.drawerWidth : 0);
   }
 
-  private cancel(): void {
+  private readonly cancel = (): void => {
     this.swipe = null;
     requestAnimationFrame(() => this.reset());
-  }
+  };
 
   private readonly handleStart = (event: TouchEvent): void => {
     this.reset();
@@ -152,7 +136,7 @@ export class NavDrawerSwipeOwner {
     const touch = swipe
       ? Array.from(event.touches).find((candidate) => candidate.identifier === swipe.identifier)
       : undefined;
-    if (!swipe || event.touches.length !== 1 || !touch) {
+    if (!this.canOpen() || !swipe || event.touches.length !== 1 || !touch) {
       this.cancel();
       return;
     }
@@ -198,6 +182,4 @@ export class NavDrawerSwipeOwner {
       requestAnimationFrame(() => this.reset());
     }
   };
-
-  private readonly handleCancel = (): void => this.cancel();
 }

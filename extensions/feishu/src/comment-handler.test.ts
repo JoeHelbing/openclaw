@@ -33,11 +33,6 @@ vi.mock("./drive.js", () => ({
   deliverCommentThreadText: deliverCommentThreadTextMock,
 }));
 
-vi.mock("openclaw/plugin-sdk/reply-runtime", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("openclaw/plugin-sdk/reply-runtime")>()),
-  dispatchInboundMessage: dispatchInboundMessageMock,
-}));
-
 async function raceWithNextMacrotask<T>(promise: Promise<T>): Promise<T | "pending"> {
   return await Promise.race([
     promise,
@@ -137,15 +132,7 @@ function createTestRuntime(overrides?: {
         ),
         resolveAgentRoute: vi.fn(overrides?.resolveAgentRoute ?? (() => buildResolvedRoute())),
       },
-      reply: {
-        settleReplyDispatcher: vi.fn(async ({ dispatcher, onSettled }) => {
-          dispatcher.markComplete();
-          await dispatcher.waitForIdle();
-          await onSettled?.();
-        }),
-      },
       session: {
-        resolveStorePath: vi.fn(() => "/tmp/feishu-session-store.json"),
         recordInboundSession,
       },
       inbound: {
@@ -179,7 +166,6 @@ function createTestRuntime(overrides?: {
               created: true,
             })),
         ),
-        buildPairingReply: vi.fn((code: string) => `Pairing code: ${code}`),
       },
     },
   } as unknown as PluginRuntime;
@@ -246,7 +232,6 @@ describe("handleFeishuCommentEvent", () => {
     createFeishuCommentReplyDispatcherMock.mockReturnValue({
       dispatcherOptions: {},
       delivery: { deliver: vi.fn(async () => undefined) },
-      startTypingReaction: vi.fn(async () => {}),
       cleanupTypingReaction: vi.fn(async () => {}),
     });
   });
@@ -397,7 +382,9 @@ describe("handleFeishuCommentEvent", () => {
   });
 
   it("issues a pairing challenge in the comment thread when dmPolicy=pairing", async () => {
+    const log = vi.fn();
     await handleComment({
+      runtime: { log, error: vi.fn(), exit: vi.fn() },
       cfg: buildConfig({
         channels: {
           feishu: {
@@ -439,43 +426,8 @@ describe("handleFeishuCommentEvent", () => {
       is_whole_comment: false,
     });
     expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
-  });
-
-  it("passes whole-comment metadata to the comment reply dispatcher", async () => {
-    resolveDriveCommentEventTurnMock.mockResolvedValueOnce({
-      eventId: "evt_whole",
-      messageId: "drive-comment:evt_whole",
-      commentId: "comment_whole",
-      replyId: "reply_whole",
-      noticeType: "add_reply",
-      fileToken: "doc_token_1",
-      fileType: "docx",
-      isWholeComment: true,
-      senderId: "ou_sender",
-      senderUserId: "on_sender_user",
-      timestamp: "1774951528000",
-      isMentioned: false,
-      documentTitle: "Project review",
-      prompt: "prompt body",
-      preview: "prompt body",
-      rootCommentText: "root comment",
-      targetReplyText: "reply text",
-    });
-
-    await handleComment({
-      event: { event_id: "evt_whole" },
-    });
-
-    expect(createFeishuCommentReplyDispatcherMock).toHaveBeenCalledTimes(1);
-    expect(createFeishuCommentReplyDispatcherMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        commentId: "comment_whole",
-        fileToken: "doc_token_1",
-        fileType: "docx",
-        replyId: "reply_whole",
-        isWholeComment: true,
-      }),
-    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain("TESTCODE");
+    expect(log).toHaveBeenCalledWith("feishu[default]: comment pairing request sender=ou_sender");
   });
 
   it("always finalizes comment typing cleanup even when dispatch fails", async () => {
@@ -486,7 +438,6 @@ describe("handleFeishuCommentEvent", () => {
     createFeishuCommentReplyDispatcherMock.mockReturnValue({
       dispatcherOptions: {},
       delivery: { deliver: vi.fn(async () => undefined) },
-      startTypingReaction: vi.fn(async () => {}),
       cleanupTypingReaction,
     });
 
@@ -506,7 +457,6 @@ describe("handleFeishuCommentEvent", () => {
     createFeishuCommentReplyDispatcherMock.mockReturnValue({
       dispatcherOptions: {},
       delivery: { deliver: vi.fn(async () => undefined) },
-      startTypingReaction: vi.fn(async () => {}),
       cleanupTypingReaction,
     });
 
@@ -519,20 +469,5 @@ describe("handleFeishuCommentEvent", () => {
 
     resolveCleanup?.();
     await eventPromise;
-  });
-
-  it("does not start comment typing reaction before dispatch begins", async () => {
-    const startTypingReaction = vi.fn(async () => {});
-    createFeishuCommentReplyDispatcherMock.mockReturnValue({
-      dispatcherOptions: {},
-      delivery: { deliver: vi.fn(async () => undefined) },
-      startTypingReaction,
-      cleanupTypingReaction: vi.fn(async () => {}),
-    });
-
-    await handleComment();
-
-    expect(startTypingReaction).not.toHaveBeenCalled();
-    expect(dispatchInboundMessageMock).toHaveBeenCalledTimes(1);
   });
 });

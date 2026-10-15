@@ -2,13 +2,16 @@ import {
   BUILTIN_THEMES,
   resolveThemeBranding,
 } from "../../../packages/gateway-protocol/src/theme.ts";
+import { registerListener } from "../../../src/shared/listeners.js";
 import type {
   ApplicationGateway,
   ApplicationTheme,
+  ApplicationThemePalette,
   ApplicationThemeServerSelection,
 } from "./context.ts";
 import { applyControlUiAccent, syncControlUiSystemChrome } from "./control-ui-presentation.ts";
 import { syncCustomThemeStyleTag } from "./custom-theme.ts";
+import { backgroundPreferenceStorageKey } from "./settings-background.ts";
 import {
   bindUiPreferences,
   loadUiPreferences,
@@ -17,9 +20,9 @@ import {
   type UiPreferences,
   type UiSettings,
 } from "./settings.ts";
-import { setCurrentThemeBranding } from "./theme-branding.ts";
+import { syncThemeBackgroundArtwork } from "./theme-background-artwork.ts";
+import { currentThemeBranding, setCurrentThemeBranding } from "./theme-branding.ts";
 import type { CatalogTheme, createThemeCatalog, ThemeCatalogSnapshot } from "./theme-catalog.ts";
-import { startThemeTransition } from "./theme-transition.ts";
 import { resolveTheme, syncThemePaletteStylesheet, type ThemeMode } from "./theme.ts";
 import {
   applyChatFontSmoothing,
@@ -60,10 +63,12 @@ function applyThemePresentation(settings: UiPreferences, catalogTheme?: CatalogT
   const effectiveTheme = dynamic && !catalogTheme ? "claw" : settings.theme;
   const mode = catalogTheme?.mode ?? settings.themeMode;
   const resolvedTheme = resolveTheme(effectiveTheme, mode);
+  const resolvedMode = resolvedTheme.endsWith("light") ? "light" : "dark";
   root.dataset.themeId = effectiveTheme;
   root.dataset.theme = resolvedTheme;
-  root.dataset.themeMode = resolvedTheme.endsWith("light") ? "light" : "dark";
+  root.dataset.themeMode = resolvedMode;
   const branding = themeBranding(settings, catalogTheme);
+  syncThemeBackgroundArtwork(root, branding, resolvedMode);
   root.dataset.themeMascot = branding.mascot;
   if (branding.avatarHat) {
     root.dataset.themeAvatarHat = branding.avatarHat;
@@ -83,7 +88,20 @@ function applyThemePresentation(settings: UiPreferences, catalogTheme?: CatalogT
   applyChatFontSmoothing(typefaces.chat);
   syncCustomThemeStyleTag(catalogTheme?.palette ?? settings.customTheme);
   applyControlUiAccent(settings.accent);
-  syncControlUiSystemChrome();
+  // Custom palette CSS can change while the theme ID and inline styles stay the same.
+  syncControlUiSystemChrome(true);
+}
+
+function livePreferencesKey(settings: UiPreferences): string {
+  // Persisted navigation bindings are boot/resume state. Live selection is
+  // published by the Gateway and agent-selection owners, not theme subscribers.
+  const {
+    sessionKey: _sessionKey,
+    lastActiveSessionKey: _lastActiveSessionKey,
+    selectedAgentId: _selectedAgentId,
+    ...preferences
+  } = settings;
+  return JSON.stringify(preferences);
 }
 
 export function createApplicationTheme(
@@ -93,6 +111,7 @@ export function createApplicationTheme(
   const { token: _token, ...initialPreferences } = initialSettings;
   let settings: UiPreferences = initialPreferences;
   let serverSelection: ApplicationThemeServerSelection | null = null;
+  let appliedPalette: ApplicationThemePalette | null = null;
   let systemThemeCleanup: (() => void) | undefined;
   const listeners = new Set<() => void>();
 
@@ -104,31 +123,32 @@ export function createApplicationTheme(
   let disposed = false;
   const publish = () => {
     const generation = ++presentationGeneration;
-    setCurrentThemeBranding(themeBranding(settings, catalog?.theme(settings.theme)));
+    let preferencesPublished = false;
+    const previousBranding = currentThemeBranding();
+    const branding = themeBranding(settings, catalog?.theme(settings.theme));
+    setCurrentThemeBranding(branding);
     syncThemePaletteStylesheet(settings.theme, () => {
       // A slower palette cannot overwrite a newer selection or a disposed app.
       if (generation !== presentationGeneration) {
         return;
       }
-      const previousMascot =
-        typeof document === "undefined" ? undefined : document.documentElement.dataset.themeMascot;
-      const previousHat =
-        typeof document === "undefined"
-          ? undefined
-          : document.documentElement.dataset.themeAvatarHat;
       applyThemePresentation(settings, catalog?.theme(settings.theme));
-      if (
-        typeof document !== "undefined" &&
-        (previousMascot !== document.documentElement.dataset.themeMascot ||
-          previousHat !== document.documentElement.dataset.themeAvatarHat)
-      ) {
+      const mode = catalog?.theme(settings.theme)?.mode ?? settings.themeMode;
+      appliedPalette = {
+        revision: generation,
+        theme: settings.theme,
+        resolvedMode: resolveTheme(settings.theme, mode).endsWith("light") ? "light" : "dark",
+      };
+      // Computed-style consumers need the applied palette, not just the new
+      // preference. Synchronous application shares the publication below.
+      if (preferencesPublished) {
         for (const listener of listeners) {
           listener();
         }
       }
       if (
         typeof document !== "undefined" &&
-        (previousMascot === "none" || document.documentElement.dataset.themeMascot === "none")
+        (previousBranding.brandIcon !== "claw" || branding.brandIcon !== "claw")
       ) {
         void import("./control-ui-environment-presentation.runtime.ts").then(
           ({ invalidateControlUiFaviconPalette, syncControlUiFavicon }) => {
@@ -144,6 +164,7 @@ export function createApplicationTheme(
     });
     // Live preferences cannot wait for a palette download. Presentation keeps
     // its own generation fence; subscribers consume the new snapshot now.
+    preferencesPublished = true;
     for (const listener of listeners) {
       listener();
     }
@@ -201,12 +222,17 @@ export function createApplicationTheme(
     () => syncControlUiSystemChrome(),
   );
 
-  const refresh = () => {
+  const refresh = (options?: { notify?: boolean }) => {
     const next = loadUiPreferences(gateway.connection.gatewayUrl);
-    if (JSON.stringify(next) === JSON.stringify(settings)) {
+    const changed = livePreferencesKey(next) !== livePreferencesKey(settings);
+    settings = next;
+    if (!changed) {
+      // Readiness can change without changing the stored preference values.
+      if (options?.notify) {
+        publish();
+      }
       return;
     }
-    settings = next;
     void loadCatalog();
     publish();
     syncSystemThemeListener();
@@ -216,7 +242,11 @@ export function createApplicationTheme(
     refresh,
   });
   const onStorage = (event: StorageEvent) => {
-    if (event.key === null || event.key === settingsKeyForGateway(gateway.connection.gatewayUrl)) {
+    if (
+      event.key === null ||
+      event.key === settingsKeyForGateway(gateway.connection.gatewayUrl) ||
+      event.key === backgroundPreferenceStorageKey(gateway.connection.gatewayUrl)
+    ) {
       refresh();
     }
   };
@@ -255,29 +285,21 @@ export function createApplicationTheme(
     get serverSelection() {
       return serverSelection;
     },
+    get appliedPalette() {
+      return appliedPalette;
+    },
     recordServerSelection(theme, scope) {
       serverSelection = { revision: (serverSelection?.revision ?? 0) + 1, scope, theme };
       publish();
     },
     setMode(mode: ThemeMode) {
-      const currentTheme = resolveTheme(settings.theme, settings.themeMode);
-      const nextTheme = resolveTheme(settings.theme, mode);
-      startThemeTransition({
-        nextTheme,
-        currentTheme,
-        applyTheme: () => {
-          patchSettings({ themeMode: mode });
-        },
-      });
+      patchSettings({ themeMode: mode });
     },
     refresh,
     retryCatalog() {
       void (catalog?.refresh() ?? loadCatalog());
     },
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
+    subscribe: (listener) => registerListener(listeners, listener),
     dispose() {
       disposed = true;
       catalog?.dispose();

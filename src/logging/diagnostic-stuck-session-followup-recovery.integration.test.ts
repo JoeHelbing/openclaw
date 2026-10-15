@@ -7,12 +7,13 @@ import {
 } from "../agents/embedded-agent-runner/runs.js";
 import { testing as embeddedRunTesting } from "../agents/embedded-agent-runner/runs.test-support.js";
 import {
-  clearSessionQueues,
   enqueueFollowupRun,
   type FollowupRun,
   type QueueSettings,
 } from "../auto-reply/reply/queue.js";
 import { createQueueTestRun } from "../auto-reply/reply/queue.test-helpers.js";
+import { clearFollowupDrainCallback } from "../auto-reply/reply/queue/drain.js";
+import { clearFollowupQueue } from "../auto-reply/reply/queue/state.js";
 import { createReplyOperation } from "../auto-reply/reply/reply-run-registry.js";
 import { testing as replyRunTesting } from "../auto-reply/reply/reply-run-registry.test-support.js";
 import {
@@ -27,6 +28,7 @@ import {
 import { emitCoreSemanticRunProgressDiagnosticEvent } from "../infra/diagnostic-semantic-run-progress.js";
 import { enqueueCommandInLane } from "../process/command-queue.js";
 import { resetCommandQueueStateForTest } from "../process/command-queue.test-support.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import {
   beginDiagnosticBackendActivity,
   closeDiagnosticEmbeddedRunOwner,
@@ -36,14 +38,25 @@ import {
 } from "./diagnostic-run-activity.js";
 import type { StuckSessionRecoveryOutcome } from "./diagnostic-session-recovery.js";
 import { recoverStuckDiagnosticSession } from "./diagnostic-stuck-session-recovery.runtime.js";
-import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "./diagnostic.js";
+import { startGatewayDiagnosticHeartbeat, stopGatewayDiagnosticHeartbeat } from "./diagnostic.js";
 import { resetDiagnosticStateForTest } from "./diagnostic.test-support.js";
+
+// These queue-only fixtures have no persisted session; force-clear persistence has its own suite.
+vi.mock("../agents/embedded-agent-runner/force-clear-session-state.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../agents/embedded-agent-runner/force-clear-session-state.js")
+  >()),
+  tryLoadForceClearSessionSnapshot: async () => undefined,
+}));
 
 describe("stuck session follow-up recovery", () => {
   const queueKeys = new Set<string>();
 
   afterEach(() => {
-    clearSessionQueues([...queueKeys]);
+    for (const key of queueKeys) {
+      clearFollowupQueue(key);
+      clearFollowupDrainCallback(key);
+    }
     queueKeys.clear();
     embeddedRunTesting.resetActiveEmbeddedRuns();
     replyRunTesting.resetReplyRunRegistry();
@@ -62,8 +75,10 @@ describe("stuck session follow-up recovery", () => {
     { allowance: "mixed tool deadlines", requestTimeoutMs: undefined, progress: "mixed-tools" },
   ])("rechecks repeated requests before releasing a lane with $allowance", async (testCase) => {
     vi.useFakeTimers({
-      toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+      toFake: ["Date", "performance", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
     });
+    // Keep request expiry aligned with the scheduler's maintenance slots.
+    vi.setSystemTime(0);
     setDiagnosticsEnabledForProcess(true);
     startDiagnosticRunActivityTracking();
     const ref = {
@@ -140,11 +155,18 @@ describe("stuck session follow-up recovery", () => {
           return outcome;
         },
       );
-      startDiagnosticHeartbeat(
+      startGatewayDiagnosticHeartbeat(
+        createTestGatewayScheduler("fake-timers"),
         { diagnostics: { enabled: true } },
         { sampleLiveness: () => null, recoverStuckSession: recover },
       );
       await vi.advanceTimersByTimeAsync(30_000);
+      const recoveryWaitMs = testCase.requestTimeoutMs ?? 30_000;
+      if (recoveryWaitMs > 30_000) {
+        expect(recover).not.toHaveBeenCalled();
+        expect(abort).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(recoveryWaitMs - 30_000);
+      }
       expect(recover).toHaveBeenCalledOnce();
       if (testCase.progress === "semantic") {
         emitCoreSemanticRunProgressDiagnosticEvent({ ...ref, reason: "assistant:progress" });
@@ -176,6 +198,7 @@ describe("stuck session follow-up recovery", () => {
       }
       dispatchRecovery.resolve();
       await vi.advanceTimersByTimeAsync(0);
+      await recover.mock.results[0]?.value;
       if (testCase.progress !== "none") {
         expect(outcomes).toMatchObject([{ status: "skipped" }]);
         expect(abort).not.toHaveBeenCalled();
@@ -184,10 +207,10 @@ describe("stuck session follow-up recovery", () => {
         expect(outcomes).toMatchObject([{ status: "aborted", action: "abort_embedded_run" }]);
         expect(abort).toHaveBeenCalledOnce();
         expect(ranQueued).toHaveBeenCalledOnce();
-        expect(waits).toEqual([30_000]);
+        expect(waits).toEqual([recoveryWaitMs]);
       }
     } finally {
-      stopDiagnosticHeartbeat();
+      stopGatewayDiagnosticHeartbeat();
       dispatchRecovery.resolve();
       releaseActive.resolve();
       backend.close();

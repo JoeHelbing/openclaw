@@ -34,7 +34,10 @@ vi.mock("../model-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../model-auth.js")>()),
   applySecretRefHeaderSentinels: (model: unknown) => model,
   ensureAuthProfileStore: compactAuthMocks.ensureAuthProfileStore,
+  ensureAuthProfileStoreAsync: compactAuthMocks.ensureAuthProfileStore,
   ensureAuthProfileStoreWithoutExternalProfiles:
+    compactAuthMocks.ensureAuthProfileStoreWithoutExternalProfiles,
+  ensureAuthProfileStoreWithoutExternalProfilesAsync:
     compactAuthMocks.ensureAuthProfileStoreWithoutExternalProfiles,
   getApiKeyForModelCore: compactAuthMocks.getApiKeyForModelCore,
 }));
@@ -72,6 +75,48 @@ afterEach(async () => {
   vi.resetAllMocks();
   await state.cleanup();
 });
+
+function registerCompactor(
+  compact: NonNullable<AgentHarness["compact"]>,
+  harness: Pick<AgentHarness, "id" | "nativeModelPolicySupport"> = { id: "copilot" },
+  nativeCompaction?: NonNullable<AgentHarness["compact"]>,
+) {
+  registerAgentHarness(
+    {
+      ...harness,
+      label: "Compaction fixture",
+      supports: () => ({ supported: true, priority: 100 }),
+      runAttempt: async () => {
+        throw new Error("Compaction must use its registered control entry");
+      },
+      compact,
+    },
+    { ownerPluginId: harness.id, nativeCompaction },
+  );
+}
+
+function compactSession(
+  params: Partial<Parameters<typeof maybeCompactAgentHarnessSession>[0]>,
+  options: Partial<Parameters<typeof maybeCompactAgentHarnessSession>[1]> = {},
+) {
+  return maybeCompactAgentHarnessSession(
+    {
+      sessionId: "session-1",
+      sessionKey: "agent:main:main",
+      sessionFile: state.path("session.jsonl"),
+      workspaceDir: state.workspaceDir,
+      agentDir: state.agentDir(),
+      agentHarnessId: "copilot",
+      config: {},
+      ...params,
+    },
+    {
+      preparedModelRuntime: generation.preparedModelRuntime,
+      sourceAuthority: { assertActive: () => {}, operatorAuthority: undefined },
+      ...options,
+    },
+  );
+}
 
 describe("harness compaction cancellation", () => {
   it.each(["manual", "required_preflight", "source revocation"] as const)(
@@ -142,36 +187,17 @@ describe("harness compaction cancellation", () => {
           }
         },
       );
-      registerAgentHarness(
+      registerCompactor(compact, { id: "codex", nativeModelPolicySupport: "exact" }, compact);
+      const operation = compactSession(
         {
-          id: "codex",
-          label: "Compaction source fixture",
-          nativeModelPolicySupport: "exact",
-          supports: () => ({ supported: true, priority: 100 }),
-          runAttempt: async () => {
-            throw new Error("Compaction must use its registered control entry");
-          },
-          compact,
-        },
-        { ownerPluginId: "codex", nativeCompaction: compact },
-      );
-      const options = {
-        preparedModelRuntime: generation.preparedModelRuntime,
-        sourceAuthority: { assertActive: () => {}, operatorAuthority },
-        ...(dispatch === "required_preflight" ? { nativeCompactionRequest: dispatch } : {}),
-      };
-      const operation = maybeCompactAgentHarnessSession(
-        {
-          sessionId: "session-1",
-          sessionKey: "agent:main:main",
-          sessionFile: state.path("session.jsonl"),
-          workspaceDir: state.workspaceDir,
-          agentDir: state.agentDir(),
           agentHarnessId: "codex",
           config,
           trigger: "manual",
         },
-        options,
+        {
+          sourceAuthority: { assertActive: () => {}, operatorAuthority },
+          ...(dispatch === "required_preflight" ? { nativeCompactionRequest: dispatch } : {}),
+        },
       );
       if (dispatch === "source revocation") {
         await expect(operation).rejects.toThrow("Compaction source revoked");
@@ -195,18 +221,7 @@ describe("harness compaction cancellation", () => {
         ok: true,
         compacted: false,
       }));
-      registerAgentHarness(
-        {
-          id: "copilot",
-          label: "Compaction cancellation fixture",
-          supports: () => ({ supported: true, priority: 100 }),
-          runAttempt: async () => {
-            throw new Error("Compaction must not start inference");
-          },
-          compact,
-        },
-        { ownerPluginId: "copilot" },
-      );
+      registerCompactor(compact);
       if (stage === "auth-route rematerialization") {
         compactAuthMocks.resolveModelAsync.mockResolvedValueOnce({
           model: {
@@ -251,24 +266,11 @@ describe("harness compaction cancellation", () => {
       });
 
       await expect(
-        maybeCompactAgentHarnessSession(
-          {
-            sessionId: "session-1",
-            sessionKey: "agent:main:main",
-            sessionFile: state.path("session.jsonl"),
-            workspaceDir: state.workspaceDir,
-            agentDir: state.agentDir(),
-            config: {},
-            provider: "local-proxy",
-            model: "proxy-model",
-            agentHarnessId: "copilot",
-            abortSignal: controller.signal,
-          },
-          {
-            preparedModelRuntime: generation.preparedModelRuntime,
-            sourceAuthority: { assertActive: () => {}, operatorAuthority: undefined },
-          },
-        ),
+        compactSession({
+          provider: "local-proxy",
+          model: "proxy-model",
+          abortSignal: controller.signal,
+        }),
       ).rejects.toBe(cancelled);
       expect(compact).not.toHaveBeenCalled();
     },
@@ -286,34 +288,11 @@ describe("harness compaction cancellation", () => {
       ok: true,
       compacted: true,
     }));
-    registerAgentHarness(
-      {
-        id: "copilot",
-        label: "Unqualified compaction fixture",
-        supports: () => ({ supported: true, priority: 100 }),
-        runAttempt: async () => {
-          throw new Error("Compaction must use its registered control entry");
-        },
-        compact,
-      },
-      { ownerPluginId: "copilot" },
-    );
+    registerCompactor(compact);
     await expect(
-      maybeCompactAgentHarnessSession(
-        {
-          sessionId: "session-1",
-          sessionKey: "agent:main:main",
-          sessionFile: state.path("session.jsonl"),
-          workspaceDir: state.workspaceDir,
-          agentDir: state.agentDir(),
-          agentHarnessId: "copilot",
-          config,
-          trigger: "manual",
-        },
-        {
-          preparedModelRuntime: generation.preparedModelRuntime,
-          sourceAuthority: { assertActive: () => {}, operatorAuthority },
-        },
+      compactSession(
+        { config, trigger: "manual" },
+        { sourceAuthority: { assertActive: () => {}, operatorAuthority } },
       ),
     ).rejects.toThrow("operator role cannot use this model");
     expect(compact).not.toHaveBeenCalled();
@@ -342,41 +321,19 @@ describe("harness compaction cancellation", () => {
         return { ok: false, compacted: false, reason: "native tail pending" };
       },
     );
-    registerAgentHarness(
-      {
-        id: "codex",
-        label: "Concurrent compaction fixture",
-        nativeModelPolicySupport: "exact",
-        supports: () => ({ supported: true, priority: 100 }),
-        runAttempt: async () => {
-          throw new Error("Compaction must use its registered control entry");
-        },
-        compact,
-      },
-      { ownerPluginId: "codex" },
-    );
+    registerCompactor(compact, { id: "codex", nativeModelPolicySupport: "exact" });
     const params = {
       runId: "same-outer-run",
-      sessionId: "session-1",
-      sessionKey: "agent:main:main",
-      sessionFile: state.path("session.jsonl"),
-      workspaceDir: state.workspaceDir,
-      agentDir: state.agentDir(),
       agentHarnessId: "codex",
-      config: {},
       trigger: "manual" as const,
     };
-    const options = {
-      preparedModelRuntime: generation.preparedModelRuntime,
-      sourceAuthority: { assertActive: () => {}, operatorAuthority: undefined },
-    };
     try {
-      await expect(
-        firstWork.run(() => maybeCompactAgentHarnessSession(params, options)),
-      ).resolves.toMatchObject({ reason: "native tail pending" });
-      await expect(
-        secondWork.run(() => maybeCompactAgentHarnessSession(params, options)),
-      ).resolves.toMatchObject({ reason: "native tail pending" });
+      await expect(firstWork.run(() => compactSession(params))).resolves.toMatchObject({
+        reason: "native tail pending",
+      });
+      await expect(secondWork.run(() => compactSession(params))).resolves.toMatchObject({
+        reason: "native tail pending",
+      });
       expect(compact).toHaveBeenCalledTimes(2);
       const [firstHost, secondHost] = hosts;
       if (!firstHost || !secondHost) {

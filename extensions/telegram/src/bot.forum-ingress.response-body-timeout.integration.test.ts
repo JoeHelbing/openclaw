@@ -160,12 +160,13 @@ describe("Telegram supergroup ingress with a stalled Bot API response body", () 
       claimMessageDispatchDedupe: async () => ({ process: true, claims: [] }),
       resolveTelegramSessionState: async () => ({
         agentId: "integration",
+        bindingMode: { kind: "none" as const },
         sessionEntry: undefined,
         sessionKey: "integration",
         storePath: "integration",
         model: undefined,
       }),
-      resolvePromptContextAmbientWatermark: () => undefined,
+      resolvePromptContextAmbientWatermark: async () => undefined,
       recordMessageForReplyChain: async (msg) => ({
         messageId: String(msg.message_id),
         sender: "integration sender",

@@ -16,10 +16,9 @@ export type ModelFallbackCandidate = ModelCandidate & {
   routeResolution: ModelFallbackRouteResolution;
 };
 
-export type FallbackAttempt = {
-  provider: string;
-  model: string;
+export type FallbackAttempt = ModelCandidate & {
   error: string;
+  rateLimitRetriesExhausted?: number;
   reason?: FailoverReason;
   authMode?: string;
   status?: number;

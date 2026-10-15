@@ -12,7 +12,6 @@ import {
 import { resolveAssistantMessagePhase } from "../../../../../src/shared/chat-message-content.js";
 import { icons } from "../../../components/icons.ts";
 import { t } from "../../../i18n/index.ts";
-import { redactToolPayloadText } from "../../../lib/browser-redact.ts";
 import type { NormalizedMessage, ToolCard } from "../../../lib/chat/chat-types.ts";
 import {
   isStandaloneToolMessageForDisplay,
@@ -24,23 +23,16 @@ import {
   extractToolCardsCached,
   isToolCardError,
   isToolCallContentBlock,
+  resolveToolCardDisplay,
   resolveToolCardOutcome,
 } from "../../../lib/chat/tool-cards.ts";
 import { stripThinkingTags } from "../../../lib/strip-thinking-tags.ts";
-import {
-  resolveCappedMessageId,
-  type AssistantMessageExpansionState,
-} from "../chat-message-recovery.ts";
+import { resolveCappedMessageId } from "../chat-message-recovery.ts";
+import { ownSessionLaunchCalls } from "../chat-spawned-subagent.ts";
 import { buildMessageItems, rawMessageTimestamp } from "../chat-thread-items.ts";
 import { coalesceToolActivityMessages } from "../chat-tool-activity-coalesce.ts";
 import { renderForwardedAttribution } from "./chat-forwarded-attribution.ts";
-import { FULL_MESSAGE_RETRY_REVISION_LIMIT } from "./chat-message-markdown.ts";
-import { renderMessageMarkdown, type AssistantMessageDisclosure } from "./chat-message-text.ts";
-
-type TranscriptMessageRecovery = {
-  getState: (messageId: string) => AssistantMessageExpansionState | undefined;
-  request: (messageId: string) => void;
-};
+import { renderMessageMarkdown } from "./chat-message-text.ts";
 
 type Entry = { key: string; timestamp: number | null } & (
   | {
@@ -129,9 +121,7 @@ function entries(messages: unknown[]): Entry[] {
         if (!text.trim()) {
           continue;
         }
-        // Recovery replaces the whole message's text, so a capped message keeps
-        // one text entry; later text blocks join it instead of each rendering
-        // the complete recovered reply.
+        // Keep capped preview identity stable across text blocks surrounding tool calls.
         if (cappedMessageId && cappedEntry?.cappedMessageId === cappedMessageId) {
           cappedEntry.text = `${cappedEntry.text}\n\n${text}`;
           continue;
@@ -182,16 +172,13 @@ function toolIcon(call: ToolCard) {
   }
 }
 
-function renderToolLine(call: ToolCard) {
+function renderToolLine(originalCall: ToolCard) {
+  const call = resolveToolCardDisplay(originalCall);
   const view = resolveToolCallView(call);
-  const raw = redactToolPayloadText(
-    (view.command ?? view.code ?? call.inputText ?? call.name).trim(),
-  );
+  const raw = (view.command ?? view.code ?? call.inputText ?? call.name).trim();
   const command = view.command ? stripShellPreamble(view.command).command : undefined;
   const label = truncateUtf16Safe(
-    redactToolPayloadText(
-      view.title ?? view.target ?? (command || view.command)?.split("\n")[0] ?? call.name,
-    ),
+    view.title ?? view.target ?? (command || view.command)?.split("\n")[0] ?? call.name,
     160,
   );
   const outcome = resolveToolCardOutcome(call, false);
@@ -214,7 +201,9 @@ function renderToolLine(call: ToolCard) {
 }
 
 function renderToolGroup(entry: Extract<Entry, { kind: "tools" }>) {
-  const overview = describeToolGroup(entry.activity);
+  const overview = describeToolGroup(entry.activity, {
+    ownSessionLaunches: ownSessionLaunchCalls(entry.calls.map(({ card }) => card)),
+  });
   return html`<details class="chat-task-feed__tool-group">
     <summary>
       <span class="chat-task-feed__overview">
@@ -238,31 +227,7 @@ function renderToolGroup(entry: Extract<Entry, { kind: "tools" }>) {
   </details>`;
 }
 
-function messageDisclosure(
-  entry: Entry,
-  recovery?: TranscriptMessageRecovery,
-): AssistantMessageDisclosure | undefined {
-  const messageId = entry.kind === "assistant" ? entry.cappedMessageId : undefined;
-  if (!messageId || !recovery) {
-    return undefined;
-  }
-  const state = recovery.getState(messageId);
-  if (!state || (state.status === "error" && state.revision < FULL_MESSAGE_RETRY_REVISION_LIMIT)) {
-    recovery.request(messageId);
-  }
-  return {
-    expanded: state?.status === "loaded",
-    ...(state?.status === "loaded" ? { markdown: stripThinkingTags(state.markdown) } : {}),
-    ...(state?.status === "error" && state.revision >= FULL_MESSAGE_RETRY_REVISION_LIMIT
-      ? { onRetryFullMessage: () => recovery.request(messageId) }
-      : {}),
-  };
-}
-
-export function renderChatTranscriptFeed(
-  messages: unknown[],
-  recovery?: TranscriptMessageRecovery,
-): TemplateResult {
+export function renderChatTranscriptFeed(messages: unknown[]): TemplateResult {
   return html`<div class="chat-task-feed">
     ${repeat(
       entries(messages),
@@ -289,7 +254,6 @@ export function renderChatTranscriptFeed(
                     {
                       role: "assistant",
                       isStreaming: false,
-                      assistantMessageDisclosure: messageDisclosure(entry, recovery),
                     },
                     {},
                   )

@@ -28,9 +28,7 @@ export function createQaCaptureLifecycle() {
       captureStoreLease = lease;
       void lease.catch(() => {
         // A failed acquisition owns no store; a later request can acquire again.
-        if (captureStoreLease === lease) {
-          captureStoreLease = undefined;
-        }
+        captureStoreLease = undefined;
       });
     }
     const pending = captureStoreLease.then(({ store }) => operation(store));
@@ -114,10 +112,8 @@ async function probeTcpReachability(
   rawUrl: string,
   timeoutMs = 700,
 ): Promise<QaStartupProbeStatus> {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
+  const parsed = URL.parse(rawUrl);
+  if (!parsed) {
     return {
       label: rawUrl,
       url: rawUrl,

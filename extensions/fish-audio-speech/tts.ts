@@ -1,5 +1,4 @@
 import type { SpeechVoiceOption } from "openclaw/plugin-sdk/speech";
-import { MAX_AUDIO_BYTES } from "openclaw/plugin-sdk/speech-provider";
 import {
   asOptionalRecord,
   normalizeTrimmedStringList,
@@ -11,7 +10,14 @@ const FISH_AUDIO_VOICES_MAX_BYTES = 2 * 1024 * 1024;
 const FISH_AUDIO_VOICE_PAGE_SIZE = 100;
 const FISH_AUDIO_MAX_OWN_VOICE_PAGES = 20;
 
-export type FishAudioModel = "s2.1-pro-free" | "s2.1-pro" | "s2-pro" | "s1";
+export const FISH_AUDIO_MODELS = [
+  "drama-3-preview",
+  "s2.1-pro-free",
+  "s2.1-pro",
+  "s2-pro",
+  "s1",
+] as const;
+export type FishAudioModel = (typeof FISH_AUDIO_MODELS)[number];
 export type FishAudioLatency = "low" | "balanced" | "normal";
 export type FishAudioFormat = "mp3" | "opus" | "wav" | "pcm";
 
@@ -218,5 +224,3 @@ export async function listFishAudioVoices(params: {
     return true;
   });
 }
-
-export const FISH_AUDIO_STREAM_MAX_BYTES = MAX_AUDIO_BYTES;
