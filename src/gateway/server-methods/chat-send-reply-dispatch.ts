@@ -435,6 +435,7 @@ export function createChatSendReplyDispatch(params: {
           mediaBySource,
           idempotencyKey: ownedTranscriptIdempotencyKey,
           managedMediaUrls: sourceMediaUrls,
+          preserveOriginalAnswer: Boolean(ttsSupplementMarker),
           scope: transcriptScope,
         });
         if (!rewritten) {

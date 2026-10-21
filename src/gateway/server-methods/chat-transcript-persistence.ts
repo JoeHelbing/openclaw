@@ -32,6 +32,8 @@ import {
   extractAssistantPhaseText,
   readAssistantTextBlocksForPhase,
 } from "../../shared/chat-message-content.js";
+import { cleanDeferredFinalText } from "../../tts/captioned-final.js";
+import { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
 import {
   ABORTED_PARTIAL_PERSISTENCE_WARNING,
   abortedPartialPersistenceError,
@@ -595,11 +597,38 @@ export async function rewriteSourceReplyTranscriptMirrors(params: {
   });
 }
 
+function readCleanedTtsAnswer(message: Record<string, unknown>): string {
+  const cleanedText = (content: readonly Record<string, unknown>[]): string => {
+    const source = { ...message, content };
+    const finalBlocks = readAssistantTextBlocksForPhase(source, "final_answer");
+    const blocks = finalBlocks.length ? finalBlocks : readAssistantTextBlocksForPhase(source);
+    const cleaner = createTtsDirectiveTextStreamCleaner();
+    const segments = blocks.map((block) => cleaner.push(block.text)).filter((part) => part.trim());
+    const tail = cleaner.flush();
+    if (tail.trim()) {
+      segments.push(tail);
+    }
+    return sanitizeAssistantDisplayText(segments.join("\n")) ?? "";
+  };
+  const priorDisplay = Array.isArray(message[ASSISTANT_DISPLAY_CONTENT_FIELD])
+    ? cleanedText(readAssistantDisplayContent(message))
+    : "";
+  if (priorDisplay) {
+    return priorDisplay;
+  }
+  const modelBlocks = readAssistantDisplayContent({ content: message.content });
+  return modelBlocks.length
+    ? cleanedText(modelBlocks)
+    : (sanitizeAssistantDisplayText(cleanDeferredFinalText(extractAssistantPhaseText(message))) ??
+        "");
+}
+
 export async function rewriteAssistantTranscriptMessageByIdempotencyKey(params: {
   content: AssistantDisplayContentBlock[];
   mediaBySource?: AssistantDisplayMediaBySource;
   idempotencyKey: string;
   managedMediaUrls?: readonly string[];
+  preserveOriginalAnswer?: boolean;
   scope: SessionTranscriptWriteScope;
 }): Promise<{ messageId: string } | null> {
   const idempotencyKey = params.idempotencyKey.trim();
@@ -612,15 +641,24 @@ export async function rewriteAssistantTranscriptMessageByIdempotencyKey(params: 
     if (!target) {
       return null;
     }
+    const visibleText = params.preserveOriginalAnswer ? readCleanedTtsAnswer(target.message) : "";
     const rewrittenEvents = events.map((event) =>
       transcriptEventId(event) === target.messageId
         ? Object.assign({}, event as Record<string, unknown>, {
-            message: buildAssistantDisplayRewrite({
-              message: target.message,
-              displayContent: params.content,
-              mediaBySource: params.mediaBySource,
-              managedMediaUrls: params.managedMediaUrls,
-            }),
+            message: {
+              ...buildAssistantDisplayRewrite({
+                message: target.message,
+                displayContent: visibleText
+                  ? [
+                      { type: "text", text: visibleText },
+                      ...params.content.filter((block) => block.type !== "text"),
+                    ]
+                  : params.content,
+                mediaBySource: params.mediaBySource,
+                managedMediaUrls: params.managedMediaUrls,
+              }),
+              ...(params.preserveOriginalAnswer ? { content: target.message.content } : {}),
+            },
           })
         : event,
     );
