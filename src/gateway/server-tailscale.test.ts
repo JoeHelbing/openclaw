@@ -6,11 +6,13 @@ const mocks = vi.hoisted(() => {
   const stopRouteClaim = vi.fn<() => Promise<void>>(async () => undefined);
   return {
     stopRouteClaim,
-    claimTailscaleRoute: vi.fn(async (_mode: "serve" | "funnel", _target: number | string) => ({
-      exited: new Promise<void>(() => {}),
-      isActive: (): boolean => true,
-      stop: stopRouteClaim,
-    })),
+    claimTailscaleRoute: vi.fn<typeof import("../infra/tailscale.js").claimTailscaleRoute>(
+      async (_mode, _target) => ({
+        exited: new Promise<void>(() => {}),
+        isActive: (): boolean => true,
+        stop: stopRouteClaim,
+      }),
+    ),
     getTailnetHostname: vi.fn<() => Promise<string | null>>(async () => null),
     getTailnetHostnameAfterServe: vi.fn<() => Promise<string | null>>(async () => null),
     hasTailscaleFunnelRouteForPort: vi.fn(async (_port: number) => false),
@@ -54,6 +56,7 @@ function resetTailscalePublishedOrigin() {
 beforeEach(resetSecretRedactionRegistryForTest);
 
 afterEach(() => {
+  vi.useRealTimers();
   resetSecretRedactionRegistryForTest();
   resetTailscalePublishedOrigin();
   for (const fn of Object.values(mocks)) {
@@ -305,33 +308,130 @@ describe("startGatewayTailscaleExposure", () => {
     },
   );
 
-  it("clears the published origin and warns when the foreground claim exits", async () => {
+  it.each(["serve", "funnel"] as const)(
+    "restores the published %s origin after the foreground claim exits",
+    async (mode) => {
+      vi.useFakeTimers();
+      const { promise: exited, resolve: resolveExit } = createDeferred();
+      mocks.claimTailscaleRoute.mockResolvedValueOnce({
+        exited,
+        isActive: () => true,
+        stop: mocks.stopRouteClaim,
+      });
+      mocks.getTailnetHostnameAfterServe.mockResolvedValue("node.tailnet.ts.net");
+      mocks.getTailnetHostname.mockResolvedValue("node.tailnet.ts.net");
+      const logTailscale = createLogger();
+      const cleanup = await startGatewayTailscaleExposure({
+        tailscaleMode: mode,
+        port: 18789,
+        logTailscale,
+      });
+
+      resolveExit();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(logTailscale.warn).toHaveBeenCalledWith(expect.stringContaining("claim exited"));
+      expect(getTailscalePublishedOrigin()).toBeUndefined();
+      expect(
+        resolveControlUiIdentity(
+          { gateway: { publicOrigin: "https://unrelated.test", tailscale: { mode } } },
+          { mode: "token", allowTailscale: true },
+        ),
+      ).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(mocks.claimTailscaleRoute).toHaveBeenCalledTimes(2);
+      expect(getTailscalePublishedOrigin()).toMatchObject({
+        origin: "https://node.tailnet.ts.net",
+        mode,
+      });
+      await cleanup?.();
+      expect(getTailscalePublishedOrigin()).toBeUndefined();
+    },
+  );
+
+  it("backs off failed recovery attempts and keeps retrying at the capped delay", async () => {
+    vi.useFakeTimers();
     const { promise: exited, resolve: resolveExit } = createDeferred();
-    mocks.claimTailscaleRoute.mockResolvedValue({
+    mocks.claimTailscaleRoute
+      .mockResolvedValueOnce({ exited, isActive: () => true, stop: mocks.stopRouteClaim })
+      .mockRejectedValueOnce(new Error("daemon down"))
+      .mockRejectedValueOnce(new Error("daemon down"))
+      .mockRejectedValueOnce(new Error("daemon down"))
+      .mockRejectedValueOnce(new Error("daemon down"));
+    mocks.getTailnetHostnameAfterServe.mockResolvedValue("node.tailnet.ts.net");
+    const cleanup = await startGatewayTailscaleExposure({
+      tailscaleMode: "serve",
+      port: 18789,
+      logTailscale: createLogger(),
+    });
+
+    resolveExit();
+    await vi.advanceTimersByTimeAsync(0);
+    for (const delay of [5_000, 10_000, 20_000, 30_000]) {
+      await vi.advanceTimersByTimeAsync(delay);
+      expect(getTailscalePublishedOrigin()).toBeUndefined();
+    }
+    expect(mocks.claimTailscaleRoute).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.claimTailscaleRoute).toHaveBeenCalledTimes(6);
+    expect(getTailscalePublishedOrigin()?.origin).toBe("https://node.tailnet.ts.net");
+    await cleanup?.();
+  });
+
+  it("cancels a scheduled recovery when the Gateway stops", async () => {
+    vi.useFakeTimers();
+    const { promise: exited, resolve: resolveExit } = createDeferred();
+    mocks.claimTailscaleRoute.mockResolvedValueOnce({
       exited,
       isActive: () => true,
       stop: mocks.stopRouteClaim,
     });
-    mocks.getTailnetHostnameAfterServe.mockResolvedValue("node.tailnet.ts.net");
-    const logTailscale = createLogger();
-
-    await startGatewayTailscaleExposure({
+    const cleanup = await startGatewayTailscaleExposure({
       tailscaleMode: "serve",
       port: 18789,
-      logTailscale,
+      logTailscale: createLogger(),
     });
-    resolveExit();
 
-    await vi.waitFor(() => {
-      expect(logTailscale.warn).toHaveBeenCalledWith(expect.stringContaining("claim exited"));
-    });
+    resolveExit();
+    await vi.advanceTimersByTimeAsync(0);
+    await cleanup?.();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.claimTailscaleRoute).toHaveBeenCalledOnce();
     expect(getTailscalePublishedOrigin()).toBeUndefined();
-    expect(
-      resolveControlUiIdentity(
-        { gateway: { publicOrigin: "https://unrelated.test", tailscale: { mode: "serve" } } },
-        { mode: "token", allowTailscale: true },
-      ),
-    ).toBeUndefined();
+  });
+
+  it("aborts and retires an in-flight recovery without publishing after shutdown", async () => {
+    vi.useFakeTimers();
+    const { promise: exited, resolve: resolveExit } = createDeferred();
+    const replacement = createDeferred<Awaited<ReturnType<typeof mocks.claimTailscaleRoute>>>();
+    const stopReplacement = vi.fn<() => Promise<void>>(async () => undefined);
+    mocks.claimTailscaleRoute
+      .mockResolvedValueOnce({ exited, isActive: () => true, stop: mocks.stopRouteClaim })
+      .mockReturnValueOnce(replacement.promise);
+    mocks.getTailnetHostnameAfterServe.mockResolvedValue("node.tailnet.ts.net");
+    const cleanup = await startGatewayTailscaleExposure({
+      tailscaleMode: "serve",
+      port: 18789,
+      logTailscale: createLogger(),
+    });
+
+    resolveExit();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(mocks.claimTailscaleRoute).toHaveBeenCalledTimes(2);
+    const recoverySignal = mocks.claimTailscaleRoute.mock.calls[1]?.[4];
+    expect(recoverySignal?.aborted).toBe(false);
+    const shutdown = cleanup?.();
+    expect(recoverySignal?.aborted).toBe(true);
+    replacement.resolve({
+      exited: new Promise<void>(() => {}),
+      isActive: () => true,
+      stop: stopReplacement,
+    });
+    await shutdown;
+    expect(stopReplacement).toHaveBeenCalledOnce();
+    expect(getTailscalePublishedOrigin()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.claimTailscaleRoute).toHaveBeenCalledTimes(2);
   });
 
   it("does not publish an origin for an externally preserved Funnel", async () => {

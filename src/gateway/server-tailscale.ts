@@ -50,62 +50,72 @@ export async function startGatewayTailscaleExposure(params: {
     }
   }
 
-  let claim: Awaited<ReturnType<typeof claimTailscaleRoute>> | undefined;
-  try {
-    claim = await claimTailscaleRoute(
-      params.tailscaleMode,
-      backendTarget,
-      params.port,
-      params.logTailscale.info,
-      params.signal,
-    );
-    const hostname = (
-      params.tailscaleMode === "serve" ? getTailnetHostnameAfterServe() : getTailnetHostname()
-    ).catch((error: unknown) => {
-      params.logTailscale.warn(
-        `Could not read the Tailscale hostname; managed portal ingress is unavailable: ${formatErrorMessage(error)}`,
+  type RouteClaim = Awaited<ReturnType<typeof claimTailscaleRoute>>;
+  const acquireClaim = async (signal: AbortSignal | undefined): Promise<RouteClaim> => {
+    let nextClaim: RouteClaim | undefined;
+    try {
+      nextClaim = await claimTailscaleRoute(
+        effectiveMode,
+        backendTarget,
+        params.port,
+        params.logTailscale.info,
+        signal,
       );
-      return null;
-    });
-    const host = await racePromiseWithAbortSignal(
-      hostname,
-      params.signal,
-      (signal) => signal.reason,
-    );
-    params.signal?.throwIfAborted();
-    if (!claim.isActive()) {
-      throw new Error(`Managed Tailscale ${params.tailscaleMode} claim exited during startup`);
-    }
-    if (host) {
-      const uiPath = params.controlUiBasePath ? `${params.controlUiBasePath}/` : "/";
-      const publicHost = resolveTailscalePublishedHost({
-        tailscaleMode: effectiveMode,
-        tailnetHost: host,
-      });
-      if (publicHost) {
-        clearPublishedOrigin = prepareTailscalePublishedOrigin({
-          origin: `https://${publicHost}`,
-          mode: effectiveMode,
-        });
-        params.logTailscale.info(
-          `${params.tailscaleMode} enabled: https://${publicHost}${uiPath} (WS via wss://${publicHost})`,
+      const hostname = (
+        params.tailscaleMode === "serve" ? getTailnetHostnameAfterServe() : getTailnetHostname()
+      ).catch((error: unknown) => {
+        params.logTailscale.warn(
+          `Could not read the Tailscale hostname; managed portal ingress is unavailable: ${formatErrorMessage(error)}`,
         );
+        return null;
+      });
+      const host = await racePromiseWithAbortSignal(hostname, signal, (aborted) => aborted.reason);
+      signal?.throwIfAborted();
+      if (!nextClaim.isActive()) {
+        throw new Error(`Managed Tailscale ${params.tailscaleMode} claim exited during startup`);
+      }
+      if (host) {
+        const uiPath = params.controlUiBasePath ? `${params.controlUiBasePath}/` : "/";
+        const publicHost = resolveTailscalePublishedHost({
+          tailscaleMode: effectiveMode,
+          tailnetHost: host,
+        });
+        if (publicHost) {
+          clearPublishedOrigin = prepareTailscalePublishedOrigin({
+            origin: `https://${publicHost}`,
+            mode: effectiveMode,
+          });
+          params.logTailscale.info(
+            `${params.tailscaleMode} enabled: https://${publicHost}${uiPath} (WS via wss://${publicHost})`,
+          );
+        } else {
+          params.logTailscale.info(`${params.tailscaleMode} enabled`);
+        }
       } else {
         params.logTailscale.info(`${params.tailscaleMode} enabled`);
       }
-    } else {
-      params.logTailscale.info(`${params.tailscaleMode} enabled`);
+      return nextClaim;
+    } catch (err) {
+      clearPublishedOrigin?.();
+      try {
+        await nextClaim?.stop();
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [err, cleanupError],
+          "Tailscale exposure startup and cleanup failed",
+          { cause: cleanupError },
+        );
+      }
+      throw err;
     }
+  };
+
+  let claim: RouteClaim;
+  try {
+    claim = await acquireClaim(params.signal);
   } catch (err) {
-    clearPublishedOrigin?.();
-    try {
-      await claim?.stop();
-    } catch (cleanupError) {
-      throw new AggregateError(
-        [err, cleanupError],
-        "Tailscale exposure startup and cleanup failed",
-        { cause: cleanupError },
-      );
+    if (err instanceof AggregateError) {
+      throw err;
     }
     params.signal?.throwIfAborted();
     if (params.tailscaleMode === "serve" && err instanceof TailscaleServeDisabledError) {
@@ -118,19 +128,54 @@ export async function startGatewayTailscaleExposure(params: {
     throw err;
   }
 
-  let stopping = false;
-  void claim.exited.then(() => {
-    if (stopping) {
+  // Startup's signal ends with startup; recovery attempts are owned by this exposure.
+  const recoveryAbort = new AbortController();
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let recovery: Promise<void> | undefined;
+  const scheduleRecovery = (delayMs = 5_000) => {
+    if (recoveryAbort.signal.aborted) {
       return;
     }
-    clearPublishedOrigin?.();
-    params.logTailscale.warn(
-      `${params.tailscaleMode} route claim exited; managed Tailscale ingress is unavailable until the Gateway restarts`,
-    );
-  });
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      recovery = acquireClaim(recoveryAbort.signal)
+        .then(
+          (nextClaim) => {
+            claim = nextClaim;
+            watchClaim(nextClaim);
+          },
+          (err: unknown) => {
+            if (recoveryAbort.signal.aborted) {
+              return;
+            }
+            params.logTailscale.warn(`${params.tailscaleMode} failed: ${formatErrorMessage(err)}`);
+            scheduleRecovery(Math.min(delayMs * 2, 30_000));
+          },
+        )
+        .finally(() => {
+          recovery = undefined;
+        });
+    }, delayMs);
+    retryTimer.unref?.();
+  };
+  const watchClaim = (activeClaim: RouteClaim) => {
+    void activeClaim.exited.then(() => {
+      if (recoveryAbort.signal.aborted) {
+        return;
+      }
+      clearPublishedOrigin?.();
+      params.logTailscale.warn(
+        `${params.tailscaleMode} route claim exited; retrying managed Tailscale ingress`,
+      );
+      scheduleRecovery();
+    });
+  };
+  watchClaim(claim);
   return async () => {
-    stopping = true;
+    recoveryAbort.abort(new Error("Managed Tailscale exposure is stopping"));
+    clearTimeout(retryTimer);
     clearPublishedOrigin?.();
+    await recovery;
     await claim.stop();
   };
 }
