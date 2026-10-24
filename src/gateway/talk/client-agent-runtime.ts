@@ -10,17 +10,31 @@ import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import type { TalkClientRunAuthority } from "./client-run-authority.js";
 
 const loadTalkAgentExecution = createLazyRuntimeModule(async () => {
-  const [embeddedAgent, admission, cliRunner, cliAuth, runEntry, runtimeResolution, placement] =
-    await Promise.all([
-      import("../../agents/embedded-agent.js"),
-      import("../../agents/admitted-run-context.js"),
-      import("../../agents/cli-runner.runtime.js"),
-      import("../../agents/cli-execution-auth.js"),
-      import("../../agents/embedded-agent-runner/run-entry-runtime.js"),
-      import("../../agents/embedded-agent-runner/run/runtime-resolution.js"),
-      import("../../agents/session-placement-admission.js"),
-    ]);
+  const [
+    embeddedAgent,
+    admission,
+    cliRunner,
+    cliAuth,
+    runEntry,
+    runtimeResolution,
+    placement,
+    deferredLifecycle,
+    callerContext,
+  ] = await Promise.all([
+    import("../../agents/embedded-agent.js"),
+    import("../../agents/admitted-run-context.js"),
+    import("../../agents/cli-runner.runtime.js"),
+    import("../../agents/cli-execution-auth.js"),
+    import("../../agents/embedded-agent-runner/run-entry-runtime.js"),
+    import("../../agents/embedded-agent-runner/run/runtime-resolution.js"),
+    import("../../agents/session-placement-admission.js"),
+    import("../../agents/embedded-agent-runner/run/deferred-lifecycle-owner.js"),
+    import("../../agents/tools/gateway-caller-context.js"),
+  ]);
   return {
+    createDeferredEmbeddedRunLifecycleManager:
+      deferredLifecycle.createDeferredEmbeddedRunLifecycleManager,
+    withGatewayToolCallerIdentity: callerContext.withGatewayToolCallerIdentity,
     runEmbeddedAgent: embeddedAgent.runEmbeddedAgent,
     runCliAgent: cliRunner.runCliAgent,
     cliBackendAcceptsAuthProfileForwarding: cliAuth.cliBackendAcceptsAuthProfileForwarding,
@@ -149,29 +163,51 @@ export function createTalkClientAgentRuntime(params: {
         // session's own CLI binding is neither resumed nor replaced.
         return await execution.withLocalSessionPlacementTurnSettlement(
           { sessionId, sessionKey, agentId, runId: runParams.runId },
-          async () =>
-            await execution.runCliAgent({
-              ...runParams,
-              preparedRunAdmission,
-              userTurnTranscriptRecorder,
-              sessionTarget: {
-                ...runParams.sessionTarget,
-                agentId,
-                sessionId,
-                sessionKey,
-                storePath,
-              },
+          async () => {
+            const lifecycle = execution.createDeferredEmbeddedRunLifecycleManager({
+              runId: runParams.runId,
+              agentId,
+              sessionId,
+              sessionKey,
               sessionFile: sessionKey,
-              storePath,
-              persistAssistantTranscript: true,
-              provider: cliExecutionProvider,
-              modelProvider: provider,
-              model: modelId,
-              requesterModel: { provider, model: modelId },
-              authProfileId,
-              nativeAuthOnly: authProfileId ? undefined : true,
-              disableCliLiveSession: true,
-            }),
+              abortSignal: runParams.abortSignal,
+            });
+            try {
+              // Register the CLI turn as the session's active run under this admitted
+              // instance; that promotes Talk's completion claim so the voice bridge
+              // may deliver the answer (an unpromoted claim drops it silently).
+              const diagnosticOwner = await execution.withGatewayToolCallerIdentity(
+                { agentId, sessionKey, operationalRunInstance },
+                () => lifecycle.handoffToCli(),
+              );
+              return await execution.runCliAgent({
+                ...runParams,
+                diagnosticOwner,
+                abortSignal: lifecycle.signal,
+                preparedRunAdmission,
+                userTurnTranscriptRecorder,
+                sessionTarget: {
+                  ...runParams.sessionTarget,
+                  agentId,
+                  sessionId,
+                  sessionKey,
+                  storePath,
+                },
+                sessionFile: sessionKey,
+                storePath,
+                persistAssistantTranscript: true,
+                provider: cliExecutionProvider,
+                modelProvider: provider,
+                model: modelId,
+                requesterModel: { provider, model: modelId },
+                authProfileId,
+                nativeAuthOnly: authProfileId ? undefined : true,
+                disableCliLiveSession: true,
+              });
+            } finally {
+              await lifecycle.complete();
+            }
+          },
           { preparedRunAdmission, abortSignal: runParams.abortSignal },
         );
       } finally {

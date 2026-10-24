@@ -1,6 +1,7 @@
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { runCliAgent } from "../../agents/cli-runner.runtime.js";
+import { prepareEmbeddedAgentRunCompletionClaim } from "../../agents/embedded-agent-runner/runs.js";
 import type { runEmbeddedAgent } from "../../agents/embedded-agent.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
@@ -66,11 +67,23 @@ function configFor(model: string, runtime?: string): OpenClawConfig {
   };
 }
 
-async function consult(config: OpenClawConfig, authority: { toolsAllow?: string[] } = {}) {
+async function consult(
+  config: OpenClawConfig,
+  authority: { toolsAllow?: string[] } = {},
+  options: Pick<
+    Parameters<typeof createTalkClientAgentRuntime>[0],
+    "bindOperationalRunInstance"
+  > & {
+    runId?: string;
+  } = {},
+) {
   const sessionKey = "agent:main:talk-cli-route";
-  const runtime = createTalkClientAgentRuntime({ config });
+  const runtime = createTalkClientAgentRuntime({
+    config,
+    bindOperationalRunInstance: options.bindOperationalRunInstance,
+  });
   return await runtime.runEmbeddedAgent({
-    runId: `talk-realtime-consult-${Math.random()}`,
+    runId: options.runId ?? `talk-realtime-consult-${Math.random()}`,
     sessionId: "voice-session",
     sessionKey,
     sessionTarget: {
@@ -116,4 +129,16 @@ it("carries restricted Talk tool authority into the CLI run", async () => {
   cli.mockResolvedValue(result);
   await consult(configFor("anthropic/claude-opus-5-5", "claude-cli"), { toolsAllow: ["read"] });
   expect(cli.mock.calls[0]?.[0]).toMatchObject({ toolsAllow: ["read"], senderIsOwner: false });
+});
+
+it("promotes the Talk completion claim so the voice bridge can deliver a CLI answer", async () => {
+  cli.mockResolvedValue(result);
+  const runId = "talk-realtime-consult-claim";
+  const claim = prepareEmbeddedAgentRunCompletionClaim("voice-session", runId);
+  await consult(
+    configFor("anthropic/claude-opus-5-5", "claude-cli"),
+    {},
+    { runId, bindOperationalRunInstance: (instance) => claim.bindOperationalRunInstance(instance) },
+  );
+  expect(claim.claimCompletion()).toBe(true);
 });
