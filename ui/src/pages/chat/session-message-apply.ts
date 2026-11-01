@@ -1,5 +1,6 @@
 import {
   normalizeSessionProjectionRunId,
+  readAssistantStreamSegmentIdentity,
   readSessionMessageIdentity,
   readSessionMessageSequence,
 } from "@openclaw/gateway-client/browser";
@@ -147,10 +148,19 @@ export function applySessionMessagePayload(
   );
   if (incoming.role === "assistant" && projection.messages.includes(message)) {
     prunePersistedAssistantStreamSegments(state, message);
-    if (assistantOwnerRunId && runActive === false) {
+    // Terminal rows replace the live tail; keyed commentary replaces only its segment.
+    if (
+      assistantOwnerRunId &&
+      (runActive === false ||
+        ((normalizeSessionProjectionRunId(event.runId) === assistantOwnerRunId ||
+          incoming.idempotencyKey === `cli-assistant:${assistantOwnerRunId}`) &&
+          !readAssistantStreamSegmentIdentity(message)))
+    ) {
       state.chatStream = null;
       state.chatStreamStartedAt = null;
-      maybeResetToolStreamRun(state, assistantOwnerRunId);
+      if (runActive === false) {
+        maybeResetToolStreamRun(state, assistantOwnerRunId);
+      }
     }
   }
   const steerTargetRunId = persistedSteerTargetRunId(message);
